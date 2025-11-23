@@ -1,30 +1,25 @@
 require('dotenv').config();
 const express = require('express');
-const fetch = require('node-fetch');
 
 const app = express();
 app.use(express.json());
 
-/**
- * Config & in-memory cache voor Marketo token
- */
 const {
   PORT = 3000,
   OPENAI_API_KEY,
   MARKETO_BASE_URL,
   MARKETO_CLIENT_ID,
   MARKETO_CLIENT_SECRET,
+  WEBHOOK_SECRET,
 } = process.env;
 
+// In-memory Marketo token cache
 let marketoToken = null;
 let marketoTokenExpiresAt = 0;
 
-/**
- * Dummy base data – in real life haal je dit uit DB / config
- * Dit is de content die voor iedereen hetzelfde is.
- */
+// Dummy base data – in real life uit DB / config
 const BASE_DATA = {
-  'VC_BASE_V1': {
+  VC_BASE_V1: {
     productName: 'Voice Cloud',
     coreBenefits: [
       'Altijd bereikbaar, ook als je niet op kantoor bent',
@@ -36,16 +31,16 @@ const BASE_DATA = {
   },
 };
 
-/**
- * Helper: Marketo access token ophalen + cachen
- */
+// --- Marketo helpers ---
+
 async function getMarketoAccessToken() {
   const now = Date.now();
   if (marketoToken && now < marketoTokenExpiresAt) {
     return marketoToken;
   }
 
-  const url = `${MARKETO_BASE_URL}/identity/oauth/token` +
+  const url =
+    `${MARKETO_BASE_URL}/identity/oauth/token` +
     `?grant_type=client_credentials` +
     `&client_id=${encodeURIComponent(MARKETO_CLIENT_ID)}` +
     `&client_secret=${encodeURIComponent(MARKETO_CLIENT_SECRET)}`;
@@ -59,19 +54,14 @@ async function getMarketoAccessToken() {
 
   const data = await res.json();
   marketoToken = data.access_token;
-  // Een beetje marge aftrekken
+  // marge aftrekken
   marketoTokenExpiresAt = now + (data.expires_in - 300) * 1000;
 
   return marketoToken;
 }
 
-/**
- * Helper: lead updaten in Marketo
- * We gaan ervan uit dat je een Marketo leadId hebt.
- */
 async function updateMarketoLead(marketoLeadId, fields) {
   const token = await getMarketoAccessToken();
-
   const url = `${MARKETO_BASE_URL}/rest/v1/leads.json`;
 
   const body = {
@@ -88,7 +78,7 @@ async function updateMarketoLead(marketoLeadId, fields) {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${token}`,
+      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -104,11 +94,9 @@ async function updateMarketoLead(marketoLeadId, fields) {
   return data;
 }
 
-/**
- * Helper: prompt opbouwen
- */
+// --- Prompt helpers ---
+
 function buildSystemPrompt(language = 'nl') {
-  // Je kan hier per taal variëren, ik hou het nu simpel
   if (language === 'nl') {
     return `
 Je bent een e-mailcopywriter voor Telenet Business.
@@ -120,7 +108,6 @@ De e-mail is bedoeld om leads te overtuigen een volgende stap te zetten.
 Output ALTIJD exact in geldig JSON-formaat (één object), zonder extra tekst.`;
   }
 
-  // fallback naar Engels
   return `
 You are an email copywriter for Telenet Business.
 Write in clear, concise, professional language.
@@ -167,22 +154,31 @@ Zorg dat htmlBody volledige, geldige HTML bevat (met <html>, <body>, …).
 Geen extra tekst rond de JSON, geen uitleg. Enkel het JSON-object.`;
 }
 
-/**
- * Helper: call naar OpenAI Chat Completions
- */
-async function generateEmailWithAI({ sector, employeeCount, jobTitle, language = 'nl', baseDataId }) {
+async function generateEmailWithAI({
+  sector,
+  employeeCount,
+  jobTitle,
+  language = 'nl',
+  baseDataId,
+}) {
   const base = BASE_DATA[baseDataId];
   if (!base) {
     throw new Error(`Onbekende baseDataId: ${baseDataId}`);
   }
 
   const systemPrompt = buildSystemPrompt(language);
-  const userPrompt = buildUserPrompt({ sector, employeeCount, jobTitle, language, base });
+  const userPrompt = buildUserPrompt({
+    sector,
+    employeeCount,
+    jobTitle,
+    language,
+    base,
+  });
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -220,12 +216,19 @@ async function generateEmailWithAI({ sector, employeeCount, jobTitle, language =
   return parsed;
 }
 
-/**
- * Webhook endpoint
- * Dit is wat je andere systeem (website, CRM, enz.) zal aanroepen.
- */
+// --- Routes ---
+
+app.get('/', (req, res) => {
+  res.send('AI → Marketo webhook is running');
+});
+
 app.post('/webhooks/ai-email', async (req, res) => {
   try {
+    // simpele header security
+    if (WEBHOOK_SECRET && req.headers['x-webhook-key'] !== WEBHOOK_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const {
       email,
       marketoLeadId,
@@ -240,7 +243,6 @@ app.post('/webhooks/ai-email', async (req, res) => {
       return res.status(400).json({ error: 'marketoLeadId is verplicht' });
     }
 
-    // 1. AI-gegenereerde e-mail ophalen
     const aiEmail = await generateEmailWithAI({
       sector,
       employeeCount,
@@ -249,7 +251,6 @@ app.post('/webhooks/ai-email', async (req, res) => {
       baseDataId,
     });
 
-    // 2. Marketo lead updaten met AI velden
     const fieldsToUpdate = {
       AI_Email_Subject__c: aiEmail.subject,
       AI_Email_Preheader__c: aiEmail.preheader,
@@ -260,7 +261,6 @@ app.post('/webhooks/ai-email', async (req, res) => {
 
     const mktoResponse = await updateMarketoLead(marketoLeadId, fieldsToUpdate);
 
-    // 3. Response terug naar caller
     res.json({
       success: true,
       message: 'AI email gegenereerd en in Marketo gezet',
@@ -273,10 +273,7 @@ app.post('/webhooks/ai-email', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('AI → Marketo webhook is running');
-});
-
+// Start server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
