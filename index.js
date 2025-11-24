@@ -154,6 +154,7 @@ Zorg dat htmlBody volledige, geldige HTML bevat (met <html>, <body>, …).
 Geen extra tekst rond de JSON, geen uitleg. Enkel het JSON-object.`;
 }
 
+
 async function generateEmailWithAI({
   sector,
   employeeCount,
@@ -183,6 +184,7 @@ async function generateEmailWithAI({
     },
     body: JSON.stringify({
       model: 'gpt-4.1-mini',
+      // extra hint naar JSON-only
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: systemPrompt },
@@ -194,27 +196,54 @@ async function generateEmailWithAI({
 
   if (!res.ok) {
     const text = await res.text();
-    console.error('OpenAI error:', text);
+    console.error('OpenAI error raw:', text);
     throw new Error('Failed to call OpenAI');
   }
 
   const data = await res.json();
-  const content = data.choices[0].message.content;
+  let content = data.choices[0].message.content;
+
+  console.log('OpenAI raw content:', content);
+
+  // --- CLEANUP STAP 1: code fences weghalen (```json ... ```)
+  // Als de AI toch in een codeblock antwoordt
+  if (content.trim().startsWith('```')) {
+    // verwijder eerste ```... regel
+    content = content.replace(/^```[a-zA-Z]*\s*/, '');
+    // verwijder laatste ```
+    content = content.replace(/```$/, '').trim();
+  }
+
+  // --- CLEANUP STAP 2: enkel het stuk tussen eerste { en laatste } nemen
+  const firstCurly = content.indexOf('{');
+  const lastCurly = content.lastIndexOf('}');
+
+  if (firstCurly === -1 || lastCurly === -1 || lastCurly <= firstCurly) {
+    console.error('OpenAI content lijkt geen JSON object te bevatten:', content);
+    throw new Error('OpenAI output bevat geen geldig JSON-object');
+  }
+
+  const jsonSlice = content.slice(firstCurly, lastCurly + 1);
 
   let parsed;
   try {
-    parsed = JSON.parse(content);
+    parsed = JSON.parse(jsonSlice);
   } catch (e) {
-    console.error('JSON parse error on OpenAI response:', content);
-    throw new Error('OpenAI did not return valid JSON');
+    console.error('JSON parse error op slice:', jsonSlice);
+    console.error('Volledige content:', content);
+    throw new Error(
+      'OpenAI output is geen zuiver JSON (zie logs voor details)'
+    );
   }
 
   if (!parsed.subject || !parsed.preheader || !parsed.htmlBody) {
-    throw new Error('OpenAI JSON is missing required fields');
+    console.error('OpenAI JSON mist verplichte velden:', parsed);
+    throw new Error('OpenAI JSON mist subject/preheader/htmlBody');
   }
 
   return parsed;
 }
+
 
 // --- Routes ---
 
